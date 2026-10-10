@@ -19,7 +19,12 @@ struct internal_ctx {
 	bool terminate: 1;
 	bool is_exit: 1;
 	bool handled: 1;
+	bool is_entry: 1;
+	/* Counts transitions; only compared across one entry action, so it may wrap */
+	uint8_t transitions;
 };
+
+BUILD_ASSERT(sizeof(struct internal_ctx) <= SIZEOF_FIELD(struct smf_ctx, internal));
 
 #ifdef CONFIG_SMF_INSTRUMENTATION
 static inline void invoke_action_hook(struct smf_ctx *ctx, const struct smf_state *state,
@@ -119,19 +124,54 @@ static const struct smf_state *get_lca_of(const struct smf_state *source,
 }
 
 /**
+ * @brief Executes the entry action of a state
+ *
+ * @param ctx State machine context
+ * @param state State being entered
+ * @return true if no more states should be entered: the action set terminate
+ *         or started another transition, else false
+ */
+static bool smf_execute_entry_action(struct smf_ctx *const ctx, const struct smf_state *state)
+{
+	struct internal_ctx *const internal = (void *)&ctx->internal;
+	const uint8_t transitions = internal->transitions;
+
+	/* Keep track of the executing entry action in case it calls smf_set_state() */
+	ctx->executing = state;
+	if (state->entry == NULL) {
+		return false;
+	}
+
+	INVOKE_ACTION_HOOK(ctx, state, SMF_ACTION_ENTRY);
+	internal->is_entry = true;
+	state->entry(ctx);
+	internal->is_entry = false;
+
+	/*
+	 * No need to continue if terminate was set, or if the action started a
+	 * transition: the states left to enter belong to the old target.
+	 */
+	if (internal->terminate || (internal->transitions != transitions)) {
+		ctx->executing = ctx->current;
+		return true;
+	}
+
+	return false;
+}
+
+/**
  * @brief Executes all entry actions from the direct child of topmost to the new state
  *
  * @param ctx State machine context
  * @param new_state State we are transitioning to
  * @param topmost State we are entering from. Its entry action is not executed
- * @return true if the state machine should terminate, else false
+ * @return true if no more states should be entered: an entry action set
+ *         terminate or started another transition, else false
  */
 static bool smf_execute_all_entry_actions(struct smf_ctx *const ctx,
 					  const struct smf_state *new_state,
 					  const struct smf_state *topmost)
 {
-	struct internal_ctx *const internal = (void *)&ctx->internal;
-
 	if (new_state == topmost) {
 		/* There are no child states, so do nothing */
 		return false;
@@ -140,34 +180,15 @@ static bool smf_execute_all_entry_actions(struct smf_ctx *const ctx,
 	for (const struct smf_state *to_execute = get_child_of(new_state, topmost);
 	     to_execute != NULL && to_execute != new_state;
 	     to_execute = get_child_of(new_state, to_execute)) {
-		/* Keep track of the executing entry action in case it calls
-		 * smf_set_state()
-		 */
-		ctx->executing = to_execute;
 		/* Execute every entry action EXCEPT that of the topmost state */
-		if (to_execute->entry) {
-			INVOKE_ACTION_HOOK(ctx, to_execute, SMF_ACTION_ENTRY);
-			to_execute->entry(ctx);
-
-			/* No need to continue if terminate was set */
-			if (internal->terminate) {
-				ctx->executing = ctx->current;
-				return true;
-			}
+		if (smf_execute_entry_action(ctx, to_execute)) {
+			return true;
 		}
 	}
 
 	/* and execute the new state entry action */
-	ctx->executing = new_state;
-	if (new_state->entry) {
-		INVOKE_ACTION_HOOK(ctx, new_state, SMF_ACTION_ENTRY);
-		new_state->entry(ctx);
-
-		/* No need to continue if terminate was set */
-		if (internal->terminate) {
-			ctx->executing = ctx->current;
-			return true;
-		}
+	if (smf_execute_entry_action(ctx, new_state)) {
+		return true;
 	}
 
 	ctx->executing = ctx->current;
@@ -228,19 +249,21 @@ static void smf_execute_ancestor_run_actions(struct smf_ctx *const ctx)
 }
 
 /**
- * @brief Executes all exit actions from ctx->current to the direct child of topmost
+ * @brief Executes all exit actions from a state to the direct child of topmost
  *
  * @param ctx State machine context
+ * @param from First state to exit
  * @param topmost State we are exiting to. Its exit action is not executed
  * @return true if the state machine should terminate, else false
  */
-static bool smf_execute_all_exit_actions(struct smf_ctx *const ctx, const struct smf_state *topmost)
+static bool smf_execute_all_exit_actions(struct smf_ctx *const ctx, const struct smf_state *from,
+					 const struct smf_state *topmost)
 {
 	struct internal_ctx *const internal = (void *)&ctx->internal;
 	const struct smf_state *tmp_state = ctx->executing;
 
-	for (const struct smf_state *to_execute = ctx->current;
-	     to_execute != NULL && to_execute != topmost; to_execute = to_execute->parent) {
+	for (const struct smf_state *to_execute = from; to_execute != NULL && to_execute != topmost;
+	     to_execute = to_execute->parent) {
 		if (to_execute->exit) {
 			ctx->executing = to_execute;
 			INVOKE_ACTION_HOOK(ctx, to_execute, SMF_ACTION_EXIT);
@@ -274,6 +297,7 @@ static void smf_clear_internal_state(struct smf_ctx *const ctx)
 	internal->terminate = false;
 	internal->handled = false;
 	internal->new_state = false;
+	internal->is_entry = false;
 }
 
 void smf_set_initial(struct smf_ctx *const ctx, const struct smf_state *init_state)
@@ -298,8 +322,6 @@ void smf_set_initial(struct smf_ctx *const ctx, const struct smf_state *init_sta
 #endif /* CONFIG_SMF_INSTRUMENTATION */
 
 #ifdef CONFIG_SMF_ANCESTOR_SUPPORT
-	struct internal_ctx *const internal = (void *)&ctx->internal;
-
 	ctx->executing = init_state;
 	/* topmost is the root ancestor of init_state, its parent == NULL */
 	const struct smf_state *topmost = get_child_of(init_state, NULL);
@@ -307,19 +329,14 @@ void smf_set_initial(struct smf_ctx *const ctx, const struct smf_state *init_sta
 	/* Execute topmost state entry action, since smf_execute_all_entry_actions()
 	 * doesn't
 	 */
-	if (topmost->entry) {
-		ctx->executing = topmost;
-		INVOKE_ACTION_HOOK(ctx, topmost, SMF_ACTION_ENTRY);
-		topmost->entry(ctx);
-		ctx->executing = init_state;
-		if (internal->terminate) {
-			/* No need to continue if terminate was set */
-			return;
-		}
+	if (smf_execute_entry_action(ctx, topmost)) {
+		/* No need to continue if terminate was set or a transition started */
+		return;
 	}
+	ctx->executing = init_state;
 
 	if (smf_execute_all_entry_actions(ctx, init_state, topmost)) {
-		/* No need to continue if terminate was set */
+		/* No need to continue if terminate was set or a transition started */
 		return;
 	}
 #else
@@ -353,7 +370,15 @@ void smf_set_state(struct smf_ctx *const ctx, const struct smf_state *new_state)
 	}
 
 #ifdef CONFIG_SMF_ANCESTOR_SUPPORT
+	/*
+	 * Called from an entry action, the transition leaves the state being
+	 * entered: the states below it on the way to ctx->current were not entered.
+	 */
+	const struct smf_state *from = internal->is_entry ? ctx->executing : ctx->current;
 	const struct smf_state *topmost;
+
+	internal->is_entry = false;
+	internal->transitions++;
 
 	if (ctx->executing != new_state && ctx->executing->parent == new_state->parent) {
 		/* Optimize sibling transitions (different states under same parent) */
@@ -373,7 +398,7 @@ void smf_set_state(struct smf_ctx *const ctx, const struct smf_state *new_state)
 	internal->new_state = true;
 
 	/* call all exit actions up to (but not including) the topmost */
-	if (smf_execute_all_exit_actions(ctx, topmost)) {
+	if (smf_execute_all_exit_actions(ctx, from, topmost)) {
 		/* No need to continue if terminate was set in the exit action */
 		return;
 	}
@@ -392,14 +417,9 @@ void smf_set_state(struct smf_ctx *const ctx, const struct smf_state *new_state)
 	internal->is_exit = false;
 
 	/* if self transition, call the entry action */
-	if ((ctx->executing == new_state) && (new_state->entry)) {
-		INVOKE_ACTION_HOOK(ctx, new_state, SMF_ACTION_ENTRY);
-		new_state->entry(ctx);
-
-		/* No need to continue if terminate was set in the entry action */
-		if (internal->terminate) {
-			return;
-		}
+	if ((ctx->executing == new_state) && smf_execute_entry_action(ctx, new_state)) {
+		/* No need to continue if terminate was set or a transition started */
+		return;
 	}
 #ifdef CONFIG_SMF_INITIAL_TRANSITION
 	/*
@@ -412,7 +432,7 @@ void smf_set_state(struct smf_ctx *const ctx, const struct smf_state *new_state)
 #endif
 
 	/* update the state variables */
-	ctx->previous = ctx->current;
+	ctx->previous = from;
 	ctx->current = new_state;
 	ctx->executing = new_state;
 
@@ -420,7 +440,7 @@ void smf_set_state(struct smf_ctx *const ctx, const struct smf_state *new_state)
 
 	/* call all entry actions (except those of topmost) */
 	if (smf_execute_all_entry_actions(ctx, new_state, topmost)) {
-		/* No need to continue if terminate was set in the entry action */
+		/* No need to continue if terminate was set or a transition started */
 		return;
 	}
 #else
