@@ -115,6 +115,14 @@ function is used.
    :c:func:`smf_set_state` from Exit functions will generate a warning in the
    log and no transition will occur.
 
+.. note:: When an Entry function calls :c:func:`smf_set_state`, the new
+   transition starts from the state whose Entry function called it: that
+   state is exited unless the new state is one of its sub-states, and it is
+   the previous state and the source given to ``on_transition``. The states
+   the first transition had not entered yet are not entered. A further call
+   from the same Entry function starts from the state the previous call
+   reached.
+
 State Machine Execution
 =======================
 
