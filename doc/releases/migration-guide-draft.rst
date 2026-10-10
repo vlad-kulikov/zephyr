@@ -58,6 +58,15 @@ Networking
 Other subsystems
 ****************
 
+State Machine Framework
+=======================
+
+* With :kconfig:option:`CONFIG_SMF_ANCESTOR_SUPPORT`, when the entry action of a parent state calls
+  :c:func:`smf_set_state`, the new transition now starts from that parent state. The child states
+  the first transition had not entered yet are no longer exited, and no longer entered after the
+  new transition. The parent state is the previous state and the source given to the
+  ``on_transition`` hook.
+
 Modules
 *******
 
