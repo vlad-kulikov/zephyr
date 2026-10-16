@@ -66,6 +66,8 @@ static struct test_object {
 	enum terminate_action terminate;
 	int b_run_count;
 	int c_run_count;
+	/* PARENT_C's entry action starts a self-transition, once */
+	bool parent_c_entry_self;
 } test_obj;
 
 /* ROOT handlers */
@@ -118,7 +120,12 @@ static void parent_ab_exit(void *obj)
 /* PARENT_C handlers */
 static void parent_c_entry(void *obj)
 {
-	(void)obj;
+	struct test_object *o = TEST_OBJECT(obj);
+
+	if (o->parent_c_entry_self) {
+		o->parent_c_entry_self = false;
+		smf_set_state(SMF_CTX(obj), &test_states[PARENT_C]);
+	}
 }
 
 static enum smf_state_result parent_c_run(void *obj)
@@ -249,6 +256,7 @@ static void run_fsm(enum terminate_action term)
 	test_obj.terminate = term;
 	test_obj.b_run_count = 0;
 	test_obj.c_run_count = 0;
+	test_obj.parent_c_entry_self = false;
 	smf_set_initial(SMF_CTX(&test_obj), &test_states[PARENT_AB]);
 	smf_set_hooks(SMF_CTX(&test_obj), &test_hooks);
 
@@ -500,5 +508,60 @@ ZTEST(smf_tests, test_smf_self_transition_instrumented_child_exit_terminate)
 	zassert_equal(transition_log[1].source, &test_states[STATE_B]);
 	zassert_equal(transition_log[1].dest, &test_states[STATE_C]);
 
+	zassert_equal(error_log_count, 0);
+}
+
+/* PARENT_C's entry starts a self-transition in Run 2: PARENT_C is re-entered and C entered once */
+ZTEST(smf_tests, test_smf_self_transition_instrumented_parent_entry_self_transition)
+{
+	reset_logs();
+	test_obj.terminate = NONE;
+	test_obj.b_run_count = 0;
+	test_obj.c_run_count = 0;
+	test_obj.parent_c_entry_self = true;
+	smf_set_initial(SMF_CTX(&test_obj), &test_states[PARENT_AB]);
+	smf_set_hooks(SMF_CTX(&test_obj), &test_hooks);
+
+	for (int i = 0; i < 3; i++) {
+		smf_run_state(SMF_CTX(&test_obj));
+	}
+
+	const struct action_record expected_actions[] = {
+		/* Run 0 */
+		{&test_states[STATE_A], SMF_ACTION_RUN},
+		{&test_states[STATE_A], SMF_ACTION_EXIT},
+		{&test_states[STATE_B], SMF_ACTION_ENTRY},
+		/* Run 1 */
+		{&test_states[STATE_B], SMF_ACTION_RUN},
+		/* Run 2 */
+		{&test_states[STATE_B], SMF_ACTION_RUN},
+		{&test_states[PARENT_AB], SMF_ACTION_RUN},
+		{&test_states[STATE_B], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_EXIT},
+		{&test_states[PARENT_C], SMF_ACTION_ENTRY},
+		{&test_states[PARENT_C], SMF_ACTION_EXIT},
+		{&test_states[PARENT_C], SMF_ACTION_ENTRY},
+		{&test_states[STATE_C], SMF_ACTION_ENTRY},
+	};
+	int expected_count = ARRAY_SIZE(expected_actions);
+
+	zassert_equal(action_log_count, expected_count, "Expected %d action hooks", expected_count);
+
+	for (int i = 0; i < expected_count; i++) {
+		zassert_equal(action_log[i].state, expected_actions[i].state,
+			      "Action %d: wrong state", i);
+		zassert_equal(action_log[i].action, expected_actions[i].action,
+			      "Action %d: wrong action type", i);
+	}
+
+	zassert_equal(transition_log_count, 3);
+	zassert_equal(transition_log[0].source, &test_states[STATE_A]);
+	zassert_equal(transition_log[0].dest, &test_states[STATE_B]);
+	zassert_equal(transition_log[1].source, &test_states[STATE_B]);
+	zassert_equal(transition_log[1].dest, &test_states[STATE_C]);
+	zassert_equal(transition_log[2].source, &test_states[PARENT_C]);
+	zassert_equal(transition_log[2].dest, &test_states[STATE_C]);
+
+	zassert_equal(smf_get_current_leaf_state(SMF_CTX(&test_obj)), &test_states[STATE_C]);
 	zassert_equal(error_log_count, 0);
 }
