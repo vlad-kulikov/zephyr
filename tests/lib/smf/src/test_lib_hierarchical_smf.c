@@ -55,7 +55,26 @@ enum terminate_action {
 static struct test_object {
 	struct smf_ctx ctx;
 	enum terminate_action terminate;
+	/* The entry action of entry_state transitions to each entry_target, once */
+	const struct smf_state *entry_state;
+	const struct smf_state *entry_target[2];
 } test_obj;
+
+static void entry_transition(void *obj, enum test_state state)
+{
+	struct test_object *o = TEST_OBJECT(obj);
+
+	if (o->entry_state != &test_states[state]) {
+		return;
+	}
+
+	o->entry_state = NULL;
+	for (size_t i = 0; i < ARRAY_SIZE(o->entry_target); i++) {
+		if (o->entry_target[i] != NULL) {
+			smf_set_state(SMF_CTX(obj), o->entry_target[i]);
+		}
+	}
+}
 
 /* Parent AB handlers */
 static void parent_ab_entry(void *obj)
@@ -65,6 +84,8 @@ static void parent_ab_entry(void *obj)
 	if (o->terminate == PARENT_ENTRY) {
 		smf_set_terminate(SMF_CTX(obj), -1);
 	}
+
+	entry_transition(obj, PARENT_AB);
 }
 
 static enum smf_state_result parent_ab_run(void *obj)
@@ -92,7 +113,7 @@ static void parent_ab_exit(void *obj)
 /* Parent C handlers */
 static void parent_c_entry(void *obj)
 {
-	(void)obj;
+	entry_transition(obj, PARENT_C);
 }
 
 static enum smf_state_result parent_c_run(void *obj)
@@ -177,7 +198,7 @@ static void state_c_exit(void *obj)
 /* State D handlers */
 static void state_d_entry(void *obj)
 {
-	(void)obj;
+	entry_transition(obj, STATE_D);
 }
 
 static enum smf_state_result state_d_run(void *obj)
@@ -212,6 +233,7 @@ static void run_fsm(enum test_state initial, enum terminate_action term)
 {
 	reset_logs();
 	test_obj.terminate = term;
+	test_obj.entry_state = NULL;
 	smf_set_initial(SMF_CTX(&test_obj), &test_states[initial]);
 	smf_set_hooks(SMF_CTX(&test_obj), &test_hooks);
 
@@ -432,4 +454,180 @@ ZTEST(smf_tests, test_smf_hierarchical_instrumented_child_exit_terminate)
 	zassert_equal(transition_log[1].dest, &test_states[STATE_C]);
 
 	zassert_equal(error_log_count, 0);
+}
+
+/* Starts in initial; the entry action of state then transitions to target0, then target1 */
+static void start_fsm(enum test_state initial, enum terminate_action term, enum test_state state,
+		      const struct smf_state *target0, const struct smf_state *target1)
+{
+	reset_logs();
+	test_obj.terminate = term;
+	test_obj.entry_state = &test_states[state];
+	test_obj.entry_target[0] = target0;
+	test_obj.entry_target[1] = target1;
+	smf_set_initial(SMF_CTX(&test_obj), &test_states[initial]);
+	smf_set_hooks(SMF_CTX(&test_obj), &test_hooks);
+}
+
+static void check_logs(const struct action_record *actions, int action_count,
+		       const struct transition_record *transitions, int transition_count)
+{
+	zassert_equal(action_log_count, action_count, "Expected %d action hooks", action_count);
+
+	for (int i = 0; i < action_count; i++) {
+		zassert_equal(action_log[i].state, actions[i].state, "Action %d: wrong state", i);
+		zassert_equal(action_log[i].action, actions[i].action,
+			      "Action %d: wrong action type", i);
+	}
+
+	zassert_equal(transition_log_count, transition_count, "Expected %d transitions",
+		      transition_count);
+
+	for (int i = 0; i < transition_count; i++) {
+		zassert_equal(transition_log[i].source, transitions[i].source,
+			      "Transition %d: wrong source", i);
+		zassert_equal(transition_log[i].dest, transitions[i].dest,
+			      "Transition %d: wrong destination", i);
+	}
+
+	zassert_equal(error_log_count, 0);
+}
+
+/* PARENT_C's entry transitions to D while B transitions to C: C is not exited or entered */
+ZTEST(smf_tests, test_smf_hierarchical_instrumented_entry_transition)
+{
+	start_fsm(STATE_B, NONE, PARENT_C, &test_states[STATE_D], NULL);
+	smf_run_state(SMF_CTX(&test_obj));
+
+	const struct action_record expected_actions[] = {
+		{&test_states[STATE_B], SMF_ACTION_RUN},
+		{&test_states[STATE_B], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_EXIT},
+		{&test_states[PARENT_C], SMF_ACTION_ENTRY},
+		{&test_states[PARENT_C], SMF_ACTION_EXIT},
+		{&test_states[STATE_D], SMF_ACTION_ENTRY},
+	};
+	const struct transition_record expected_transitions[] = {
+		{&test_states[STATE_B], &test_states[STATE_C]},
+		{&test_states[PARENT_C], &test_states[STATE_D]},
+	};
+
+	check_logs(expected_actions, ARRAY_SIZE(expected_actions), expected_transitions,
+		   ARRAY_SIZE(expected_transitions));
+	zassert_equal(smf_get_current_leaf_state(SMF_CTX(&test_obj)), &test_states[STATE_D]);
+}
+
+/* PARENT_C's entry transitions to D and then to A: the second transition starts from D */
+ZTEST(smf_tests, test_smf_hierarchical_instrumented_entry_two_transitions)
+{
+	start_fsm(STATE_B, NONE, PARENT_C, &test_states[STATE_D], &test_states[STATE_A]);
+	smf_run_state(SMF_CTX(&test_obj));
+
+	const struct action_record expected_actions[] = {
+		{&test_states[STATE_B], SMF_ACTION_RUN},
+		{&test_states[STATE_B], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_EXIT},
+		{&test_states[PARENT_C], SMF_ACTION_ENTRY},
+		{&test_states[PARENT_C], SMF_ACTION_EXIT},
+		{&test_states[STATE_D], SMF_ACTION_ENTRY},
+		{&test_states[STATE_D], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_ENTRY},
+		{&test_states[STATE_A], SMF_ACTION_ENTRY},
+	};
+	const struct transition_record expected_transitions[] = {
+		{&test_states[STATE_B], &test_states[STATE_C]},
+		{&test_states[PARENT_C], &test_states[STATE_D]},
+		{&test_states[STATE_D], &test_states[STATE_A]},
+	};
+
+	check_logs(expected_actions, ARRAY_SIZE(expected_actions), expected_transitions,
+		   ARRAY_SIZE(expected_transitions));
+	zassert_equal(smf_get_current_leaf_state(SMF_CTX(&test_obj)), &test_states[STATE_A]);
+}
+
+/* PARENT_C's entry transitions to C, the state being entered: C is entered once */
+ZTEST(smf_tests, test_smf_hierarchical_instrumented_entry_transition_to_target)
+{
+	start_fsm(STATE_B, NONE, PARENT_C, &test_states[STATE_C], NULL);
+	smf_run_state(SMF_CTX(&test_obj));
+
+	const struct action_record expected_actions[] = {
+		{&test_states[STATE_B], SMF_ACTION_RUN},
+		{&test_states[STATE_B], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_EXIT},
+		{&test_states[PARENT_C], SMF_ACTION_ENTRY},
+		{&test_states[STATE_C], SMF_ACTION_ENTRY},
+	};
+	const struct transition_record expected_transitions[] = {
+		{&test_states[STATE_B], &test_states[STATE_C]},
+		{&test_states[PARENT_C], &test_states[STATE_C]},
+	};
+
+	check_logs(expected_actions, ARRAY_SIZE(expected_actions), expected_transitions,
+		   ARRAY_SIZE(expected_transitions));
+	zassert_equal(smf_get_current_leaf_state(SMF_CTX(&test_obj)), &test_states[STATE_C]);
+}
+
+/* PARENT_AB's entry transitions to B while D transitions to A: A is not exited or entered */
+ZTEST(smf_tests, test_smf_hierarchical_instrumented_entry_transition_to_sibling)
+{
+	start_fsm(STATE_D, NONE, PARENT_AB, &test_states[STATE_B], NULL);
+	smf_set_state(SMF_CTX(&test_obj), &test_states[STATE_A]);
+
+	const struct action_record expected_actions[] = {
+		{&test_states[STATE_D], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_ENTRY},
+		{&test_states[STATE_B], SMF_ACTION_ENTRY},
+	};
+	const struct transition_record expected_transitions[] = {
+		{&test_states[STATE_D], &test_states[STATE_A]},
+		{&test_states[PARENT_AB], &test_states[STATE_B]},
+	};
+
+	check_logs(expected_actions, ARRAY_SIZE(expected_actions), expected_transitions,
+		   ARRAY_SIZE(expected_transitions));
+	zassert_equal(smf_get_current_leaf_state(SMF_CTX(&test_obj)), &test_states[STATE_B]);
+}
+
+/* PARENT_C's entry transitions to A, whose entry terminates: nothing runs after it */
+ZTEST(smf_tests, test_smf_hierarchical_instrumented_entry_transition_terminate)
+{
+	start_fsm(STATE_B, ENTRY, PARENT_C, &test_states[STATE_A], NULL);
+	zassert_equal(smf_run_state(SMF_CTX(&test_obj)), -1);
+
+	const struct action_record expected_actions[] = {
+		{&test_states[STATE_B], SMF_ACTION_RUN},
+		{&test_states[STATE_B], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_EXIT},
+		{&test_states[PARENT_C], SMF_ACTION_ENTRY},
+		{&test_states[PARENT_C], SMF_ACTION_EXIT},
+		{&test_states[PARENT_AB], SMF_ACTION_ENTRY},
+		{&test_states[STATE_A], SMF_ACTION_ENTRY},
+	};
+	const struct transition_record expected_transitions[] = {
+		{&test_states[STATE_B], &test_states[STATE_C]},
+		{&test_states[PARENT_C], &test_states[STATE_A]},
+	};
+
+	check_logs(expected_actions, ARRAY_SIZE(expected_actions), expected_transitions,
+		   ARRAY_SIZE(expected_transitions));
+}
+
+/* D's entry transitions to A during the initial transition: a later transition starts from A */
+ZTEST(smf_tests, test_smf_hierarchical_instrumented_initial_entry_transition)
+{
+	start_fsm(STATE_D, NONE, STATE_D, &test_states[STATE_A], NULL);
+	smf_set_state(SMF_CTX(&test_obj), &test_states[STATE_B]);
+
+	const struct action_record expected_actions[] = {
+		{&test_states[STATE_A], SMF_ACTION_EXIT},
+		{&test_states[STATE_B], SMF_ACTION_ENTRY},
+	};
+	const struct transition_record expected_transitions[] = {
+		{&test_states[STATE_A], &test_states[STATE_B]},
+	};
+
+	check_logs(expected_actions, ARRAY_SIZE(expected_actions), expected_transitions,
+		   ARRAY_SIZE(expected_transitions));
+	zassert_equal(smf_get_current_leaf_state(SMF_CTX(&test_obj)), &test_states[STATE_B]);
 }
